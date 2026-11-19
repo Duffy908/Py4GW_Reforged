@@ -457,9 +457,16 @@ def _enabled_consumable_upkeeps() -> tuple[int, ...]:
     collapsed because `ConfigureUpkeep` would otherwise register two services
     for one model.
     """
+    once_per_load_ids = {
+            ModelID.Infinite_Birds_Eye_Compass.value,
+            ModelID.Infinite_Stalkers_Ration.value,
+        }
     enabled: list[int] = []
     if _activate_conset:
-        enabled.extend(model_id for model_id in CONSET_MODEL_IDS if model_id in _selected_conset)
+        enabled.extend(
+            model_id for model_id in CONSET_MODEL_IDS
+            if model_id in _selected_conset and model_id not in once_per_load_ids
+        )
     if _activate_pcons:
         enabled.extend(model_id for model_id in PCON_UPKEEPS if model_id in _selected_pcons)
     return tuple(dict.fromkeys(enabled))
@@ -1140,11 +1147,41 @@ def _build_run_completion(definition: VanquishDefinition) -> BehaviorTree:
     )
 
 
+def _build_once_per_load_consumables() -> BehaviorTree:
+    once_per_load_ids = (
+        ModelID.Infinite_Birds_Eye_Compass.value,
+        ModelID.Infinite_Stalkers_Ration.value,
+    )
+
+    def _use_items(*_args) -> BehaviorTree.NodeState:
+        if _activate_conset:
+            for model_id in once_per_load_ids:
+                if model_id in _selected_conset:
+                    try:
+                        item_id = int(GLOBAL_CACHE.Inventory.GetFirstModelID(model_id) or 0)
+                        if item_id > 0:
+                            GLOBAL_CACHE.Inventory.UseItem(item_id)
+                    except Exception:
+                        pass
+        return BehaviorTree.NodeState.SUCCESS
+
+    return BehaviorTree(
+        BehaviorTree.ActionNode(
+            name='UseOncePerLoadConsumables',
+            action_fn=_use_items,
+        )
+    )
+
+
 def get_execution_steps(definition: VanquishDefinition) -> list[tuple[str, Callable[[], BehaviorTree]]]:
     steps: list[tuple[str, Callable[[], BehaviorTree]]] = [
         (
             f'Prepare {definition.map_name}',
             lambda definition=definition: _build_run_preparation(definition),
+        ),
+        (
+            'Use once-per-load consumables',
+            _build_once_per_load_consumables,
         ),
     ]
 
@@ -1188,6 +1225,20 @@ def get_execution_steps(definition: VanquishDefinition) -> list[tuple[str, Calla
                 ),
             )
         )
+
+        steps.extend(
+        [
+            (
+                'Cleanup sweeps',
+                lambda definition=definition: _build_cleanup_sweeps(definition),
+            ),
+            (
+                'Complete and return',
+                lambda definition=definition: _build_run_completion(definition),
+            ),
+        ]
+    )
+    return steps
 
     steps.extend(
         [

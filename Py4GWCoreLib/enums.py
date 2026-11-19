@@ -114,7 +114,7 @@ CONSUMABLE_MODELID_TO_EFFECT_NAME = {
     int(ModelID.Essence_Of_Celerity.value): "Essence_of_Celerity_item_effect",
     int(ModelID.Grail_Of_Might.value): "Grail_of_Might_item_effect",
     int(ModelID.Heroes_Trifectas.value): "Essence_of_Celerity_item_effect",
-    int(ModelID.Empowering_Feasts.value): "Essence_of_Celerity_item_effect",
+    int(ModelID.Empowering_Feasts.value): "Candy_Corn_skill",
     int(ModelID.Infinite_Birds_Eye_Compass.value): "Bird's Eye View",
     int(ModelID.Infinite_Stalkers_Ration.value): "Seek and Destroy",
     int(ModelID.Birthday_Cupcake.value): "Birthday_Cupcake_skill",

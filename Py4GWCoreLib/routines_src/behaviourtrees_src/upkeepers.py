@@ -122,20 +122,18 @@ class BTUpkeepers:
         "Empowering_Feasts": {
             "rule": "effect upkeep",
             "model_id": ModelID.Empowering_Feasts.value,
-            "effect name": "Essence_of_Celerity_item_effect",
+            "effect name": "Candy_Corn_skill",
             "require_effect_id": True,
         },
         "Infinite stalkers ration": {
             "rule": "effect upkeep",
             "model_id": ModelID.Infinite_Stalkers_Ration.value,
-            "effect name": "Seek and Destroy",
-            "require_effect_id": True,
+            "fallback_duration_ms": 4 * 60 * 60 * 1000,
         },
         "Infinite birds eye compass": {
             "rule": "effect upkeep",
             "model_id": ModelID.Infinite_Birds_Eye_Compass.value,
-            "effect name": "Bird's Eye View",
-            "require_effect_id": True,
+            "fallback_duration_ms": 4 * 60 * 60 * 1000,
         },
         "blue_rock_candy": {
             "rule": "effect_upkeep",
