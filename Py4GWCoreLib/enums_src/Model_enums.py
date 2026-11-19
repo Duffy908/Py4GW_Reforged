@@ -1210,6 +1210,7 @@ class ModelID(IntEnum):
     Enchanted_Lodestone = 431
     Elemental_Crystal_Shard = 38302
     Elemental_Keystone = 38301
+    Empowering_Feasts = 38618
     Enchanted_Vine = 834
     Encrusted_Lodestone = 451
     Encrypted_Charr_Battle_Plans = 27976
@@ -1332,6 +1333,7 @@ class ModelID(IntEnum):
     Heket_Warrior_Mini = 22760
     Heleynes_Insight = 36676
     Heros_Handbook = 26899
+    Heroes_Trifectas = 38619
     Heros_Zaishen_Strongbox = 36666
     Herring_Mini_Black_Moa_Chick_Incubator = 26502
     High_Priest_Zhang_Mini = 36649
@@ -1355,6 +1357,8 @@ class ModelID(IntEnum):
     Imperial_Guard_Requisition_Order = 29108
     Imperial_Guard_Summon = 30210
     Incubus_Wing = 27034
+    Infinite_Birds_Eye_Compass = 38616
+    Infinite_Stalkers_Ration = 38615
     Inscribed_Secret = 19196
     Inscribed_Shard = 1587
     Inscriptions_All = 15542
