@@ -113,6 +113,30 @@ class BTUpkeepers:
             "model_id": ModelID.Grail_Of_Might.value,
             "effect_name": "Grail_of_Might_item_effect",
         },
+        "Heores_Trifectas": {
+            "rule": "effect upkeep",
+            "model_id": ModelID.Heroes_Trifectas.value,
+            "effect name": "Essence_of_Celerity_item_effect",
+            "require_effect_id": True,
+        },
+        "Empowering_Feasts": {
+            "rule": "effect upkeep",
+            "model_id": ModelID.Empowering_Feasts.value,
+            "effect name": "Essence_of_Celerity_item_effect",
+            "require_effect_id": True,
+        },
+        "Infinite stalkers ration": {
+            "rule": "effect upkeep",
+            "model_id": ModelID.Infinite_Stalkers_Ration.value,
+            "effect name": "Seek and Destroy",
+            "require_effect_id": True,
+        },
+        "Infinite birds eye compass": {
+            "rule": "effect upkeep",
+            "model_id": ModelID.Infinite_Birds_Eye_Compass.value,
+            "effect name": "Bird's Eye View",
+            "require_effect_id": True,
+        },
         "blue_rock_candy": {
             "rule": "effect_upkeep",
             "model_id": ModelID.Blue_Rock_Candy.value,
