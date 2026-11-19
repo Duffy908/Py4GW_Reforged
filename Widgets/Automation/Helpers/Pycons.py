@@ -3354,6 +3354,44 @@ try:
         {"key": "armor_of_salvation", "label": "Armor of Salvation", "model_id": int(ModelID.Armor_Of_Salvation.value), "skills": ["Armor_of_Salvation_item_effect"], "use_where": "explorable"},
         {"key": "essence_of_celerity", "label": "Essence of Celerity", "model_id": int(ModelID.Essence_Of_Celerity.value), "skills": ["Essence_of_Celerity_item_effect"], "use_where": "explorable"},
         {"key": "grail_of_might", "label": "Grail of Might", "model_id": int(ModelID.Grail_Of_Might.value), "skills": ["Grail_of_Might_item_effect"], "use_where": "explorable"},
+        {
+            "key": "empowering_feasts",
+            "label": "Empowering Feast",
+            "model_id": int(ModelID.Empowering_Feasts.value),
+            "skills": ["Birthday_Cupcake_skill", "Candy_Apple_skill", "Golden_Egg_skill", "Candy_Corn_skill", "Pie_Induced_Ecstasy", "Well_Supplied"],
+            "use_where": "explorable",
+        },
+        {
+            "key": "heroes_trifecta",
+            "label": "Heroes' Trifecta",
+            "model_id": int(ModelID.Heroes_Trifectas.value),
+            "skills": ["Grail_of_Might_item_effect", "Armor_of_Salvation_item_effect", "Essence_of_Celerity_item_effect"],
+            "use_where": "explorable",
+        },
+        {
+            "key": "infinite_birds_eye_compass",
+            "label": "Infinite Bird's Eye Compass",
+            "model_id": int(ModelID.Infinite_Birds_Eye_Compass.value),
+            "skills": ["Bird's_Eye_View", "Birds_Eye_View"],
+            "use_where": "explorable",
+            "once_per_explorable": True,
+        },
+        {
+            "key": "infinite_stalkers_ration",
+            "label": "Infinite Stalker's Ration",
+            "model_id": int(ModelID.Infinite_Stalkers_Ration.value),
+            "skills": ["Seek_and_Destroy"],
+            "use_where": "explorable",
+            "once_per_explorable": True,
+        },
+
+# --------------------------------------------------------
+#   CONSUMABLE_TOOLTIPS:
+# "empowering_feasts": "Applies Birthday Cupcake, Candy Apple, Golden Egg, Candy Corn, Slice of Pumpkin Pie, and War Supplies effects for 30 minutes (lost on death).",
+# "heroes_trifecta": "Applies Grail of Might, Armor of Salvation, and Essence of Celerity effects to your party for 30 minutes (persists through death).",
+# "infinite_birds_eye_compass": "Unlimited-use explorable item that grants Bird's Eye View (increased map exploration radius) for the current instance.",
+# "infinite_stalkers_ration": "Unlimited-use explorable item that grants Seek and Destroy (pings nearby foes on the mini-map) for the current instance.",
+# ---------------------------------------------------------
 
         # Explorable (alphabetical by label)
         {"key": "birthday_cupcake", "label": "Birthday Cupcake", "model_id": int(ModelID.Birthday_Cupcake.value), "skills": ["Birthday_Cupcake_skill"], "use_where": "explorable"},
@@ -4904,6 +4942,23 @@ try:
         except Exception:
             language = 0
         return int(map_id), int(region), int(district), int(language)
+
+    _used_in_explorable_sig = {}
+
+    def _already_used_in_current_explorable(key: str) -> bool:
+        if not _in_explorable():
+            return False
+        sig = _current_map_signature()
+        if not sig or int(sig[0]) <= 0:
+            return False
+        return _used_in_explorable_sig.get(str(key)) == sig
+
+    def _mark_used_in_current_explorable(key: str):
+        if not _in_explorable():
+            return
+        sig = _current_map_signature()
+        if sig and int(sig[0]) > 0:
+            _used_in_explorable_sig[str(key)] = sig
 
     def _player_xy() -> tuple[float, float] | None:
         try:
@@ -6940,9 +6995,16 @@ try:
         restock_timer.Start()
         return False
 
+    def _should_skip_once_per_explorable(key: str) -> bool:
+        spec = ALL_BY_KEY.get(str(key or ""), {}) if isinstance(ALL_BY_KEY, dict) else {}
+        return bool(spec.get("once_per_explorable", False)) and _already_used_in_current_explorable(key)
+
     def _use_item_id(item_id: int, key: str) -> bool:
         try:
             GLOBAL_CACHE.Inventory.UseItem(int(item_id))
+            spec = ALL_BY_KEY.get(str(key or ""), {}) if isinstance(ALL_BY_KEY, dict) else {}
+            if bool(spec.get("once_per_explorable", False)):
+                _mark_used_in_current_explorable(key)
             # immediate + scheduled refreshes to catch delayed state updates
             try:
                 _refresh_inventory_cache(force=True)
@@ -6954,6 +7016,7 @@ try:
         except Exception as e:
             _debug(f"UseItem failed (item_id={item_id}, key={key}): {e}", Console.MessageType.Warning)
             return False
+        
 
     # -------------------------
     # Alcohol "real" drunk level (best-effort)
@@ -10059,6 +10122,9 @@ try:
                 continue
 
             if not _allowed_here(spec, in_explorable):
+                continue
+
+            if _should_skip_once_per_explorable(key):
                 continue
 
             movement_category = _movement_category_for_spec(spec)
