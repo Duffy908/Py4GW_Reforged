@@ -52,8 +52,8 @@ HERO_AGGRESSIVE_MODE = 1
 EXTRA_CHEST_MODEL_IDS: Tuple[int, ...] = (44,)
 
 MAP_LOAD_ITEMS: Tuple[int, ...] = (
-    int(ModelID.Infinite_Stalker_Ration),
-    int(ModelID.Infinite_Compass),
+    int(ModelID.Infinite_Birds_Eye_Compass.value),
+    int(ModelID.Infinite_Stalkers_Ration.value),
 )
 
 TEAM_PRESET_SIZES = [4, 6, 8]
