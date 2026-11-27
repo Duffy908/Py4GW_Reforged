@@ -20,7 +20,6 @@ from Py4GWCoreLib import GLOBAL_CACHE, HeroType, Map, Player, PyImGui
 from Py4GWCoreLib.BottingTree import BottingTree
 from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree
 from Py4GWCoreLib.enums_src.Title_enums import TitleID, TITLE_TIERS
-from Py4GWCoreLib.enums_src.Model_enums import ModelID
 from Py4GWCoreLib.routines_src.BehaviourTrees import BT as CoreBT
 from Sources.ApoSource.ApoBottingLib import wrappers as BT
 from Sources.aC_Scripts.aC_api.Verify_Blessing import Blessings
@@ -51,11 +50,14 @@ HERO_AGGRESSIVE_MODE = 1
 # runs of these maps would spawn different chest gadget models (not covered).
 EXTRA_CHEST_MODEL_IDS: Tuple[int, ...] = (44,)
 
+<<<<<<< HEAD
 MAP_LOAD_ITEMS: Tuple[int, ...] = (
     int(ModelID.Infinite_Birds_Eye_Compass.value),
     int(ModelID.Infinite_Stalkers_Ration.value),
 )
 
+=======
+>>>>>>> parent of c375be35 (Update Reputation Farmer BT.py)
 TEAM_PRESET_SIZES = [4, 6, 8]
 TEAM_PRESET_SLOT_COUNTS = {4: 3, 6: 5, 8: 7}
 
@@ -964,23 +966,6 @@ def _reset_blessing_tracking() -> BehaviorTree:
         )
     )
 
-def _use_map_load_items() -> BehaviorTree:
-    def _use_items(_node: BehaviorTree.Node) -> BehaviorTree.NodeState:
-        try:
-            for model_id in MAP_LOAD_ITEMS:
-                item_id = GLOBAL_CACHE.Inventory.GetFirstModelID(model_id)
-                if item_id:
-                    GLOBAL_CACHE.Inventory.UseItem(item_id)
-        except Exception:
-            pass
-        return BehaviorTree.NodeState.SUCCESS
-
-    return BehaviorTree(
-        BehaviorTree.ActionNode(
-            name="Use Map Load Items",
-            action_fn=_use_items,
-        )
-    )
 
 def _confirm_effect(
     candidate_ids: Tuple[int, ...],
@@ -1355,7 +1340,6 @@ def _killing_loop(route: Route) -> BehaviorTree:
         )
 
     children.append(_reset_blessing_tracking())
-    children.append(_use_map_load_items())
     children.extend(AggressiveEnv())
 
     def _take_blessing(blessing: Blessing) -> None:
@@ -1464,7 +1448,6 @@ def _bounty_loop(route: Route) -> BehaviorTree:
         )
     children.append(BT.MoveAndExitMap(route.exit_pos, target_map_id=route.explorable_id))
     children.append(_reset_blessing_tracking())
-    children.append(_use_map_load_items())
     children.extend(AggressiveEnv())
     children.append(
         _confirmed_interaction(

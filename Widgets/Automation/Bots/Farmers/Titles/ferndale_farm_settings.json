@@ -1,0 +1,11 @@
+{
+  "consumables": {
+    "heroes_trifectas": false,
+    "empowering_feasts": false,
+    "infinite_birds_eye_compass": true,
+    "infinite_stalkers_ration": true
+  },
+  "open_locked_chests": true,
+  "verbose_logging": false,
+  "clear_area_radius": 3500.0
+}
