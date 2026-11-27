@@ -22,6 +22,7 @@ from Py4GWCoreLib.Map import Map
 from Py4GWCoreLib.Player import Player
 from Py4GWCoreLib.enums import Range
 from Py4GWCoreLib.enums import SharedCommandType
+from Py4GWCoreLib.enums_src.Model_enums import GadgetModelID
 from Py4GWCoreLib.enums_src.Model_enums import ModelID
 from Py4GWCoreLib.enums_src.Region_enums import District
 from Py4GWCoreLib.py4gwcorelib_src.BehaviorTree import BehaviorTree
@@ -104,6 +105,12 @@ ZQUEST_QUEST_TEXT_POLL_MS = 500
 RECOVERY_SUPPRESS_TIMEOUT_MS = 90_000
 _RESIGNING_KEY = 'zquest_resigning'
 
+# Locked chest opening config (includes Hard Mode Locked Chest gadget ID 44)
+LOCKED_CHEST_SEARCH_RADIUS = 3000.0
+EXTRA_CHEST_MODEL_IDS: tuple[int, ...] = (44,)
+_open_locked_chests = True
+_opened_chest_ids: set[int] = set()
+
 # Consumable upkeep. The core list already separates the conset trio from the
 # plain pcons, so the same split the Reputation Farmer uses is reused here
 # rather than hard-coding model IDs a second time.
@@ -182,6 +189,7 @@ _KEY_RESTOCK_MULTI_ACCOUNT = 'RestockMultiAccount'
 _KEY_KEEP_GOLD_ON_ACCOUNTS = 'KeepGoldOnAccounts'
 _KEY_AUTOMATIC_ZQUEST = 'AutomaticZQuestHandling'
 _KEY_QUEUE_ITEMS = 'VanquishQueue'
+_KEY_OPEN_LOCKED_CHESTS = 'OpenLockedChests'
 
 MAP_ROOT = os.path.join(
     PySystem.Console.get_projects_path(),
@@ -464,6 +472,7 @@ def _load_settings() -> None:
     global automatic_zquest
     global take_zquest, loop_runs
     global vanquish_queue
+    global _open_locked_chests
 
     if _settings_loaded:
         return
@@ -474,18 +483,12 @@ def _load_settings() -> None:
     _restock_scroll_of_resurrection = _settings.get_bool(_SETTINGS_SECTION, _KEY_RESTOCK_SCROLL_OF_RESURRECTION, True)
     _restock_multi_account = _settings.get_bool(_SETTINGS_SECTION, _KEY_RESTOCK_MULTI_ACCOUNT, True)
     _keep_gold_on_accounts = _settings.get_bool(_SETTINGS_SECTION, _KEY_KEEP_GOLD_ON_ACCOUNTS, True)
+    _open_locked_chests = _settings.get_bool(_SETTINGS_SECTION, _KEY_OPEN_LOCKED_CHESTS, True)
     automatic_zquest = _settings.get_bool(_SETTINGS_SECTION, _KEY_AUTOMATIC_ZQUEST, False)
     vanquish_queue = _parse_queue(_settings.get_str(_SETTINGS_SECTION, _KEY_QUEUE_ITEMS, ''))
     if vanquish_queue:
-        # A queued run owns the plan shape, so the signpost flows cannot run with
-        # it: every entry has to be a map the party travels to, not the one the
-        # signpost happens to hand over. A stored combination from before the
-        # queue existed is corrected here instead of being trusted.
         automatic_zquest = False
     if automatic_zquest:
-        # A stored combination from an older build has to respect the rule the UI
-        # enforces: the signpost feeds the resolution and a loop would have
-        # nothing left to accept on its second pass.
         loop_runs = False
     _sync_take_zquest()
 
@@ -508,6 +511,7 @@ def _save_settings() -> None:
     _settings.set(_SETTINGS_SECTION, _KEY_RESTOCK_SCROLL_OF_RESURRECTION, _restock_scroll_of_resurrection)
     _settings.set(_SETTINGS_SECTION, _KEY_RESTOCK_MULTI_ACCOUNT, _restock_multi_account)
     _settings.set(_SETTINGS_SECTION, _KEY_KEEP_GOLD_ON_ACCOUNTS, _keep_gold_on_accounts)
+    _settings.set(_SETTINGS_SECTION, _KEY_OPEN_LOCKED_CHESTS, _open_locked_chests)
     _settings.set(_SETTINGS_SECTION, _KEY_AUTOMATIC_ZQUEST, automatic_zquest)
     _settings.set(_SETTINGS_SECTION, _KEY_QUEUE_ITEMS, _serialize_queue(vanquish_queue))
     _settings.set(_SETTINGS_SECTION, _KEY_SELECTED_CONSET, _serialize_model_id_list(_selected_conset))
@@ -515,16 +519,11 @@ def _save_settings() -> None:
 
 
 def _enabled_consumable_upkeeps() -> tuple[int, ...]:
-    """Upkeep model IDs for the currently enabled and individually selected items.
-
-    Ordering follows the core lists (consets then pcons); duplicates are
-    collapsed because `ConfigureUpkeep` would otherwise register two services
-    for one model.
-    """
+    """Upkeep model IDs for the currently enabled and individually selected items."""
     once_per_load_ids = {
-            ModelID.Infinite_Birds_Eye_Compass.value,
-            ModelID.Infinite_Stalkers_Ration.value,
-        }
+        ModelID.Infinite_Birds_Eye_Compass.value,
+        ModelID.Infinite_Stalkers_Ration.value,
+    }
     enabled: list[int] = []
     if _activate_conset:
         enabled.extend(
@@ -564,21 +563,7 @@ def _consumables_short_of_target() -> bool:
 
 
 def _runtime_restock_node() -> BehaviorTree:
-    """Resolve the restock list when the step is ticked, not when it is built.
-
-    `get_execution_steps` builds the whole plan once at tree creation, so a
-    restock node baked in at build time would freeze the list that was enabled
-    at that moment. Building it inside a Subtree keeps the Consumables toggles
-    meaningful for the next run without a full plan rebuild.
-
-    `RoutinesBT.Items.RestockItems` samples the storage cache once per item and,
-    with `allow_missing=True`, treats a cold zero read as "nothing to do" and
-    advances. The first model in the list therefore risks being skipped on the
-    run's opening frames (observed live: Essence of Celerity, first in
-    CONSET_UPKEEPS, only landed on a second run). The remediation is a settle
-    wait plus a second pass -- but the wait is gated on the bags actually being
-    short, so a run whose consumables are already stocked pays no delay at all.
-    """
+    """Resolve the restock list when the step is ticked, not when it is built."""
 
     def _build(_node: BehaviorTree.Node) -> BehaviorTree:
         items = _consumable_restock_items()
@@ -596,14 +581,7 @@ def _runtime_restock_node() -> BehaviorTree:
 
 
 def _restock_retry_guard() -> BehaviorTree:
-    """Settle, then re-run the restock only if something is still missing.
-
-    The selector semantics matter here: a first child that returns SUCCESS
-    short-circuits the whole guard (nothing missing, no delay), while returning
-    FAILURE hands control to the settle-and-retry branch. Returning RUNNING
-    would pin the selector to the first child permanently, so it is deliberately
-    not used.
-    """
+    """Settle, then re-run the restock only if something is still missing."""
 
     def _nothing_missing(_node: BehaviorTree.Node) -> BehaviorTree.NodeState:
         if _consumables_short_of_target():
@@ -641,11 +619,7 @@ def _restock_retry_guard() -> BehaviorTree:
 
 
 def _remote_account_emails() -> list[str]:
-    """Emails of the other clients in the shared-memory group, self excluded.
-
-    Each receiver resolves the command through its own Messaging widget. The
-    sender is skipped because its bags are already handled by the local nodes.
-    """
+    """Emails of the other clients in the shared-memory group, self excluded."""
     try:
         sender_email = str(Player.GetAccountEmail() or '')
         accounts = GLOBAL_CACHE.ShMem.GetAllAccountData() or []
@@ -662,13 +636,6 @@ def _remote_account_emails() -> list[str]:
 
 
 def _summon_map_tuple(account: object) -> tuple[int, int, int, int]:
-    """The four fields `SummonAllAccounts` compares between accounts.
-
-    Copied from `routines_src/behaviourtrees_src/shared.py:_account_map_tuple` so
-    the census reports exactly what the summon step decides on: map, region,
-    district and language. Region and language are part of that comparison even
-    though no travel can change them, which is why they are printed here.
-    """
     map_obj = getattr(getattr(account, 'AgentData', None), 'Map', None)
     return (
         int(getattr(account, 'MapID', 0) or getattr(map_obj, 'MapID', 0) or 0),
@@ -679,7 +646,6 @@ def _summon_map_tuple(account: object) -> tuple[int, int, int, int]:
 
 
 def _live_map_tuple() -> tuple[int, int, int, int]:
-    """This client's map identity straight from the live API."""
     try:
         return (
             int(Map.GetMapID() or 0),
@@ -692,22 +658,6 @@ def _live_map_tuple() -> tuple[int, int, int, int]:
 
 
 def _shared_memory_census(include_isolated: bool = True) -> list[str]:
-    """One line per account the account mirror shows right now.
-
-    The mirror is written by the native multibox module: one slot per client, a
-    full push every frame from each client's `DrawLoop`, and this side only reads
-    it. So an alt missing from this list is not being hidden by a stale reader —
-    it either is not publishing (client not injected, still logging in, or stuck
-    on a loading screen) or it lost a slot claim to another client. Neither is
-    something this widget can refresh; the census exists to tell the two apart
-    from "the alt is there but somewhere else".
-
-    `match` compares each account's map tuple against the leader's the same way
-    the summon step does, so a run log shows who that step would target and why.
-
-    `include_isolated` is on because isolation hides accounts from every normal
-    query, and a hidden alt looks exactly like a missing one in the logs.
-    """
     try:
         accounts = list(GLOBAL_CACHE.ShMem.GetAllAccountData(include_isolated=include_isolated) or [])
     except Exception as error:
@@ -737,9 +687,6 @@ def _shared_memory_census(include_isolated: bool = True) -> list[str]:
         is_account = 'yes' if bool(getattr(account, 'IsAccount', False)) else 'no'
         isolated = ' isolated' if bool(getattr(account, 'IsIsolated', False)) else ''
         matches_leader = 'yes' if (map_id, region, district, language) == local_tuple else 'no'
-        # LastUpdated is a 32-bit truncation of the frame clock. A value ahead of
-        # ours (publishers run a frame or two later) would otherwise read as a
-        # 49-day-old slot, so the top half of the range is treated as "just now".
         age_ms = (now - int(getattr(account, 'LastUpdated', 0) or 0)) % (1 << 32)
         if age_ms > 0x80000000:
             age_ms = 0
@@ -752,21 +699,12 @@ def _shared_memory_census(include_isolated: bool = True) -> list[str]:
 
 
 def _log_shared_memory_census() -> BehaviorTree.NodeState:
-    """Write the census to the console before anyone is gathered."""
     for line in _shared_memory_census():
         PySystem.Console.Log(MODULE_NAME, line, PySystem.Console.MessageType.Info)
     return BehaviorTree.NodeState.SUCCESS
 
 
 def _remote_restock_commands() -> tuple[tuple[SharedCommandType, int], ...]:
-    """Shared restock commands for the enabled groups, one quantity each.
-
-    The shared command surface is aggregate: `RestockConset` and
-    `RestockAllPcons` restock a fixed model list with a single quantity, so the
-    per-item checklist cannot travel over the bus. Quantities, however, mirror
-    the local target: `RestockAllPcons` runs at the pcon quantity and the scroll,
-    which that handler also moves, is topped up to its own target afterwards.
-    """
     items = _consumable_restock_items()
     if not items:
         return ()
@@ -791,22 +729,12 @@ def _remote_restock_commands() -> tuple[tuple[SharedCommandType, int], ...]:
 
     scroll_quantity = _highest_quantity({scroll_id})
     if scroll_quantity > 0:
-        # RestockAllPcons already pulled the scroll up to the pcon quantity; this
-        # pass raises it to its own, higher target.
         commands.append((SharedCommandType.RestockResurrectionScroll, scroll_quantity))
 
     return tuple(commands)
 
 
 def _remote_restock_node() -> BehaviorTree:
-    """Restock the other accounts in the group through the shared command bus.
-
-    Requires the `Messaging` widget on every receiver: without it the message is
-    never consumed and the dispatch wait runs into its timeout. Recipients and
-    commands are resolved when the step ticks, so toggles and party changes apply
-    to the next run without a plan rebuild.
-    """
-
     def _build(_node: BehaviorTree.Node) -> BehaviorTree:
         if not _restock_multi_account:
             return BT.Succeeder('Remote Restock Disabled')
@@ -837,14 +765,6 @@ def _remote_restock_node() -> BehaviorTree:
 
 
 def _keep_gold_node() -> BehaviorTree:
-    """Leave `KEEP_GOLD_AMOUNT` on every account during the preparation.
-
-    Reuses the existing `WithdrawGold` shared command, which equalizes in both
-    directions: it deposits the excess over the target and withdraws from storage
-    when the character is short. Recipients resolve it through their own
-    `Messaging` widget, so that widget has to be running on every client.
-    """
-
     def _build(_node: BehaviorTree.Node) -> BehaviorTree:
         if not _keep_gold_on_accounts:
             return BT.Succeeder('Keep Gold Disabled')
@@ -893,14 +813,6 @@ def _selected_map() -> str:
 def _load_transit_data(
     module: object, map_name: str, ids: Mapping
 ) -> tuple[tuple[int, ...], tuple[list[object], ...]]:
-    """Transit legs in walking order: the map each one exits into, and its path.
-
-    `ids` is the dictionary the caller already resolved. Reading it by name again
-    here would lose the transit ids of a legacy map file whose ID dictionary has an
-    unrelated variable name, while still finding its `<map>_transit_path`: the legs
-    stay but point at the final map, and the outpost exit can never reach the first
-    transit map.
-    """
     transit_ids: list[int] = []
     transit_paths: list[list[object]] = []
 
@@ -932,14 +844,7 @@ def load_selected_definition() -> VanquishDefinition:
 
 
 def load_definition(region: str, map_name: str) -> VanquishDefinition:
-    """Load one map module by region and name, whoever picked it.
-
-    Split out of `load_selected_definition` so the automatic ZQuest handling can
-    load the area it read from the quest without touching the combos.
-    """
     module_name = f'{MAP_PACKAGE}.{region}.{map_name}'
-    # The map pack is data, so drop the cached copy and re-read the file: a live
-    # edit is picked up on the next tree build after a widget reload.
     importlib.invalidate_caches()
     try:
         module = importlib.import_module(module_name)
@@ -958,9 +863,6 @@ def load_definition(region: str, map_name: str) -> VanquishDefinition:
 
     ids = getattr(module, f'{map_name}_ids', None)
     if not isinstance(ids, Mapping):
-        # Compatibility with two legacy map files whose ID dictionary had an
-        # unrelated variable name. The supplied hotfixes correct them, while
-        # this fallback makes the BT script tolerant of an older map folder.
         candidates = [
             value
             for key, value in vars(module).items()
@@ -994,20 +896,12 @@ def load_definition(region: str, map_name: str) -> VanquishDefinition:
 
 
 def _active_map_name() -> str:
-    """Map the UI reports: the resolved one in automatic mode."""
     if automatic_zquest and _auto_definition is not None:
         return _auto_definition.map_name
     return _selected_map()
 
 
 def _strip_quest_markup(text: str) -> str:
-    """Quest text without the client's markup and control characters.
-
-    Two kinds of noise show up in the strings the client returns: colour tags like
-    `<c=@Quest>` and unresolved substitution markers like the `{s}` the vanquish
-    objective can carry at the very start. Both are dropped, otherwise the text
-    never begins with the verb the parser looks for.
-    """
     plain: list[str] = []
     angle = 0
     brace = 0
@@ -1031,15 +925,6 @@ def _strip_quest_markup(text: str) -> str:
 
 
 def _objective_area(objectives: str) -> tuple[str, str]:
-    """(area, location) named by a vanquish objective.
-
-    Objectives read `Clear <area> near <outpost> of all enemies in hard mode.` or
-    `Clear <area> in <region> of all enemies in hard mode.`. The area is what is
-    left after the verb, once the mode clause and the location clause are cut
-    away: `Clear the Floodplain of Mahnkelon in Kourna of all enemies in hard
-    mode.` yields (`the Floodplain of Mahnkelon`, `Kourna`). Returns two empty
-    strings when the text is not a vanquish objective.
-    """
     text = _strip_quest_markup(objectives or '')
     lowered = text.lower()
     for verb in ('clear ', 'vanquish '):
@@ -1050,8 +935,6 @@ def _objective_area(objectives: str) -> tuple[str, str]:
     else:
         return '', ''
 
-    # The mode clause sits at the end and must go first: `in hard mode` is also a
-    # location-looking phrase and would otherwise be taken as the area's location.
     for marker in (' of all enemies', ' in hard mode', ' in normal mode'):
         position = rest_lowered.find(marker)
         if position >= 0:
@@ -1070,12 +953,6 @@ def _objective_area(objectives: str) -> tuple[str, str]:
 
 
 def _area_key(text: str) -> str:
-    """Comparison key for an area or region name.
-
-    Map files are named without spaces (`PongmeiValley`, `TheAlkaliPan`) while the
-    objective has them and often carries a leading article, so the key drops
-    everything but letters and digits and then the article.
-    """
     key = ''.join(character for character in text.lower() if character.isalnum())
     if key.startswith('the'):
         key = key[3:]
@@ -1083,7 +960,6 @@ def _area_key(text: str) -> str:
 
 
 def _region_matches_hint(region: str, location: str) -> bool:
-    """Whether a catalog region answers the location clause of the objective."""
     hint = _area_key(location)
     if not hint:
         return False
@@ -1091,23 +967,12 @@ def _region_matches_hint(region: str, location: str) -> bool:
     return hint in region_key or region_key in hint
 
 
-# Map files whose name differs from the in-game area name. The wiki and the
-# client both spell this one `Tahnnakai Temple`; the file drops an `a`, so the
-# day it comes up the area would never match.
 _MAP_FILE_ALIASES: dict[str, tuple[str, str]] = {
     'tahnnakaitemple': ('Factions_KainengCity', 'TahnnakiTemple'),
 }
 
 
 def _match_map_key(area_key: str, location: str = '') -> tuple[str, str]:
-    """Catalog (region, map) whose name matches the area, most specific first.
-
-    Tiers: equality, map name ending with the area, area ending with the map name,
-    containment. A tier that names several maps is narrowed by the location
-    clause when the objective has one, which is what separates the two
-    `DeldrimorBowl` entries. Anything still ambiguous is reported as no match:
-    guessing would run the wrong route.
-    """
     if not area_key:
         return '', ''
     alias = _MAP_FILE_ALIASES.get(area_key)
@@ -1132,9 +997,6 @@ def _match_map_key(area_key: str, location: str = '') -> tuple[str, str]:
             hinted = [pair for pair in found if _region_matches_hint(pair[0], location)]
             if len(hinted) == 1:
                 return hinted[0]
-            # The map pack can hold one area twice under different region folders
-            # (`DeldrimorBowl`). Those entries describe the same area, so the first
-            # one wins instead of stopping the run over a data duplication.
             if len({pair[1] for pair in found}) == 1:
                 return sorted(found)[0]
             return '', ''
@@ -1142,7 +1004,6 @@ def _match_map_key(area_key: str, location: str = '') -> tuple[str, str]:
 
 
 def _resolve_map_from_text(text: str) -> tuple[str, str]:
-    """Catalog (region, map) named by a vanquish objective or description."""
     area, location = _objective_area(text)
     if not area:
         return '', ''
@@ -1150,7 +1011,6 @@ def _resolve_map_from_text(text: str) -> tuple[str, str]:
 
 
 def _resolve_map_from_quest_name(name: str) -> tuple[str, str]:
-    """Catalog (region, map) named by a quest title, the last fallback source."""
     text = _strip_quest_markup(name or '')
     if ':' in text:
         text = text.rsplit(':', 1)[-1]
@@ -1167,7 +1027,6 @@ def _condition(name: str, condition_fn: Callable[[], bool]) -> BehaviorTree:
 
 
 def _as_int(value: object, default: int = 0) -> int:
-    """Coerce a value coming out of a dict, a widget or shared memory to int."""
     try:
         return int(float(str(value)))
     except Exception:
@@ -1175,7 +1034,6 @@ def _as_int(value: object, default: int = 0) -> int:
 
 
 def _as_float(value: object, default: float = 0.0) -> float:
-    """Coerce a value coming out of a dict or shared memory to float."""
     try:
         return float(str(value))
     except Exception:
@@ -1198,10 +1056,6 @@ def _vanquish_completed() -> bool:
     if not (Map.IsExplorable() and Map.IsVanquishable()):
         return False
 
-    # The world context briefly reports 0 killed / 0 remaining while some
-    # explorable maps are still initializing.  Map.IsVanquishCompleted()
-    # only checks ``foes_to_kill == 0`` and therefore returns a false positive
-    # during that window, which would skip every named route point instantly.
     foes_killed = int(Map.GetFoesKilled() or 0)
     foes_remaining = int(Map.GetFoesToKill() or 0)
     counter_initialized = (foes_killed + foes_remaining) > 0
@@ -1326,13 +1180,6 @@ def _build_keyword_action(
                 log=True,
             )
         else:
-            # BT.TakeBlessing's no-faction multibox fan-out sends
-            # SharedCommandType.GetBlessing, whose ProcessMessages case is a
-            # no-op in Widgets/System/Messaging.py. The followers never receive
-            # the dialog, and the unconsumed message wedges their inbox, so
-            # later commands (restock, travel, resign) are never dispatched.
-            # Take the shrine through the fan-out commands whose receivers ARE
-            # wired instead, mirroring Reputation Farmer Multibox BT.
             child = BT.Sequence(
                 name='BlessShrine',
                 children=[
@@ -1466,7 +1313,6 @@ def _reverse_path(path: Sequence[object]) -> list[object]:
 
 
 def _build_outpost_exit(definition: VanquishDefinition) -> BehaviorTree:
-    """Walk out of the outpost into the first map of the vanquish."""
     first_target = definition.explorable_id
     if definition.transit_ids and definition.transit_ids[0] > 0:
         first_target = definition.transit_ids[0]
@@ -1481,6 +1327,7 @@ def _build_outpost_exit(definition: VanquishDefinition) -> BehaviorTree:
 
 
 def _mark_run_started(definition: VanquishDefinition) -> BehaviorTree.NodeState:
+    _opened_chest_ids.clear()
     stats.start_run()
     PySystem.Console.Log(
         MODULE_NAME,
@@ -1501,7 +1348,6 @@ def _mark_run_completed() -> BehaviorTree.NodeState:
 
 
 def _build_completion_fallback() -> BehaviorTree:
-    """Stop the bot when the vanquish is still incomplete after both sweeps."""
     return BT.Sequence(
         name='VanquishIncomplete',
         children=[
@@ -1518,13 +1364,6 @@ def _build_completion_fallback() -> BehaviorTree:
 
 
 def _build_resign_if_in_explorable(definition: VanquishDefinition) -> BehaviorTree:
-    """Return to the outpost when the run starts inside an explorable.
-
-    A queue's last entry no longer resigns, so the party is left standing in the
-    map it cleared. Map travel only works from an outpost, so without this the
-    first travel of the next run would wait for a map load that never comes.
-    """
-
     def _build(_node: BehaviorTree.Node) -> BehaviorTree:
         if not Map.IsExplorable():
             return BT.Succeeder('AbleToTravel')
@@ -1540,21 +1379,9 @@ def _build_resign_if_in_explorable(definition: VanquishDefinition) -> BehaviorTr
 
 def _build_run_preparation(definition: VanquishDefinition) -> BehaviorTree:
     children: list[BehaviorTree] = [
-        # A finished queue leaves the party in the map it cleared, so the next run
-        # can start out here: resign first, because travel needs an outpost.
         _build_resign_if_in_explorable(definition),
-        # The plan's own Form Party step forms in whatever outpost the run
-        # started in; this dissolves that group so every account reaches the
-        # vanquish outpost alone and nothing is left to travel together.
         BT.LeaveParty(),
-        # Travel first, with the same helper the staging and reward steps use, so
-        # the outpost approach also picks a randomised low-traffic district. The
-        # hard-mode switch that `BT.Sequence(map_id_or_name=...)` used to apply
-        # after its own travel now rides along explicitly.
         _build_travel_to_map(definition.outpost_id, 'Outpost'),
-        # The shared travel helper only waits for the map, while the outpost
-        # approach also has to wait for the party to finish loading before the
-        # restock and the exit start touching the outpost.
         RoutinesBT.Party.WaitForPartyLoaded(
             timeout_ms=REMOTE_PARTY_TIMEOUT_MS,
             log=True,
@@ -1573,10 +1400,8 @@ def _build_run_preparation(definition: VanquishDefinition) -> BehaviorTree:
             children.append(_remote_restock_node())
 
     children.append(_keep_gold_node())
-    children.append(_action('RecordRunStart', _mark_run_started))
+    children.append(_action('RecordRunStart', lambda _node: _mark_run_started(definition)))
 
-    # The outpost exit belongs to the preparation; the intermediate travels are
-    # their own named step and only exist when the map really has transit paths.
     if definition.outpost_path:
         children.append(_build_outpost_exit(definition))
 
@@ -1587,17 +1412,6 @@ def _build_run_preparation(definition: VanquishDefinition) -> BehaviorTree:
 
 
 class RouteItem(NamedTuple):
-    """One planner step of a walking leg.
-
-    The map is carried with the point, and in the step name, because transit legs
-    and the vanquish route use their own coordinate spaces: reading a point from
-    one map against a position from another paths into a wall, and the console
-    cannot tell the two apart without the id in the name.
-
-    `combat` selects the flavour: the forward route vanquishes each point with its
-    clear radius, while a transit leg only walks it.
-    """
-
     kind: str  # 'point' | 'exit' | 'action' | 'wait_map'
     step_name: str
     map_id: int
@@ -1609,8 +1423,6 @@ class RouteItem(NamedTuple):
 
 
 def _iter_path_items(path: Sequence[object]) -> list[tuple[str, object]]:
-    """Flatten a route path into (keyword, value) items in walking order."""
-
     if _is_plain_path(path):
         return [('path', path)]
 
@@ -1621,7 +1433,6 @@ def _iter_path_items(path: Sequence[object]) -> list[tuple[str, object]]:
 
 
 def _transit_leg_map_id(definition: VanquishDefinition, index: int) -> int:
-    """Map one transit leg walks in: its own target, not the final map."""
     if 0 <= index < len(definition.transit_ids) and definition.transit_ids[index] > 0:
         return int(definition.transit_ids[index])
     return int(definition.explorable_id or definition.outpost_id)
@@ -1638,14 +1449,6 @@ def _vanquish_route_map_id(definition: VanquishDefinition) -> int:
 
 
 def _vanquish_route_items(definition: VanquishDefinition) -> list[RouteItem]:
-    """Every walking step in planner order, split by point and by keyword.
-
-    Transit legs are expanded by the same code as the vanquish route, so the
-    Navigation list shows one step per waypoint for both and every step name
-    carries the map it walks in. The reverse sweeps stay one step: they re-walk
-    the whole path, not a single waypoint.
-    """
-
     items: list[RouteItem] = []
     point_number = 0
     action_number = 0
@@ -1685,8 +1488,6 @@ def _vanquish_route_items(definition: VanquishDefinition) -> list[RouteItem]:
         next_map_id = _transit_next_map_id(definition, index)
 
         if _is_plain_path(transit_path) and next_map_id > 0:
-            # A plain transit leg used to be one MoveAndExitMap: walked in order and
-            # exited at the portal. Split by point, the exit stays on the last one.
             points = _coordinate_path(transit_path, f'transit path {index + 1}')
             for position, point in enumerate(points):
                 is_last = position == len(points) - 1
@@ -1702,8 +1503,6 @@ def _vanquish_route_items(definition: VanquishDefinition) -> list[RouteItem]:
                 continue
             _add_action(map_id, key, key, value, combat=False)
 
-        # The same explicit wait the leg builder appends, so a structured leg also
-        # ends on the map it walks into.
         if next_map_id > 0 and definition.explorable_id > 0:
             _add_action(map_id, f'map {next_map_id}', 'map', next_map_id, combat=False)
 
@@ -1719,8 +1518,6 @@ def _vanquish_route_items(definition: VanquishDefinition) -> list[RouteItem]:
 
 
 def _build_route_item(definition: VanquishDefinition, item: RouteItem) -> BehaviorTree:
-    """Build the tree for one route item, labelled with its step name."""
-
     if item.kind == 'wait_map':
         return BT.WaitForMapLoad(
             map_id=_as_int(item.value, 0),
@@ -1755,8 +1552,6 @@ def _build_route_item(definition: VanquishDefinition, item: RouteItem) -> Behavi
     if item.combat:
         return _build_forward_point(definition, point, item.number)
 
-    # A transit waypoint: the same movement the leg builder used before the split
-    # (pause on combat, no clear radius), just walked one point at a time.
     return BT.Move([point], pause_on_combat=True, log=False)
 
 
@@ -1765,17 +1560,6 @@ def _recovery_suppression(
     since_ms: float,
     now_ms: float,
 ) -> tuple[bool, float, bool]:
-    """Decide whether a resign still blocks recovery.
-
-    Returns `(blocked, suppressed_since_ms, timed_out)`.
-
-    The widget marks its own resign around `BT.Resign`, because the core service
-    that ships with the planner reads `party_wipe_recovery_suppressed` and this
-    widget keeps that flag raised for its whole life. The timeout exists because a
-    tree reset during the resign can leave the marker set, and a stuck marker
-    would silently disable recovery for the rest of the session.
-    """
-
     if not suppressed:
         return False, 0.0, False
     if since_ms <= 0.0:
@@ -1792,17 +1576,6 @@ def _route_resume_step(
     failed_step_name: str,
     planner_names: Sequence[str],
 ) -> str:
-    """Nearest waypoint to the shrine, ahead or behind, in the map the party is in.
-
-    The rule is geometric: whichever point is closest to the resurrection shrine
-    wins, whether the party had already walked it or not, so the resume walk is as
-    short as the map allows. Transit legs are included, because their points carry
-    the map they walk in.
-
-    One guard remains: the search stops at the next non-point step, so a resume can
-    never land past a blessing, a gadget or a map change that has not run yet.
-    """
-
     items = _vanquish_route_items(definition)
     names = list(planner_names)
 
@@ -1839,11 +1612,6 @@ def _route_resume_step(
 
 
 def _active_definition(map_id: int) -> VanquishDefinition | None:
-    """Definition whose route is the map the party is standing on.
-
-    Automatic mode resolved a map the combos never selected, and a queue walks
-    several maps in one plan, so the combo is only right in single-map runs.
-    """
     if automatic_zquest and _auto_definition is not None:
         return _auto_definition
     if vanquish_queue:
@@ -1859,7 +1627,6 @@ def _active_definition(map_id: int) -> VanquishDefinition | None:
 
 
 def _step_name_map_id(step_name: str) -> int:
-    """Map id carried by a `Point N (map M)` / `Action N: label (map M)` name."""
     start = step_name.rfind('(map ')
     if start < 0 or not step_name.endswith(')'):
         return 0
@@ -1867,13 +1634,10 @@ def _step_name_map_id(step_name: str) -> int:
     return int(raw) if raw.isdigit() else 0
 
 
-# Planner step name of the reverse passes; the phase of every other route step is
-# read from the map id its name carries.
 SWEEP_STEP_NAME = 'Cleanup sweeps'
 
 
 def _map_name_from_step(step_name: str) -> str:
-    """Queue map name carried by a planner step, empty when it carries none."""
     for prefix in ('Prepare ', f'{SWEEP_STEP_NAME} ', 'Complete and return '):
         if step_name.startswith(prefix):
             return step_name[len(prefix):]
@@ -1888,22 +1652,113 @@ def _map_name_from_step(step_name: str) -> str:
     return ''
 
 
+def _find_nearest_locked_chest(
+    max_distance: float = LOCKED_CHEST_SEARCH_RADIUS,
+) -> tuple[int, Coordinate] | None:
+    """Find the nearest unvisited locked chest gadget in an explorable map."""
+    if not _open_locked_chests or not Map.IsMapReady() or not Map.IsExplorable():
+        return None
+    try:
+        player_id = int(Player.GetAgentID() or 0)
+        if player_id <= 0 or Agent.IsDead(player_id) or Checks.Agents.InDanger():
+            return None
+        origin = Player.GetXY()
+        known_chest_ids = {
+            int(member.value) for member in GadgetModelID if member.name.startswith('CHEST_')
+        } | {int(mid) for mid in EXTRA_CHEST_MODEL_IDS}
+
+        gadgets = AgentArray.Sort.ByDistance(
+            AgentArray.Filter.ByDistance(AgentArray.GetGadgetArray(), origin, float(max_distance)),
+            origin,
+        )
+        for gadget_id in gadgets:
+            gid = int(gadget_id)
+            if gid in _opened_chest_ids or not Agent.IsValid(gid):
+                continue
+            model_id = int(Agent.GetGadgetID(gid) or 0)
+            if model_id in known_chest_ids:
+                gx, gy = Agent.GetXY(gid)
+                return gid, (float(gx), float(gy))
+    except Exception:
+        return None
+    return None
+
+
+def LockedChestOpenerService() -> BehaviorTree:
+    """Background service tree that moves to and opens nearby locked chests when safe."""
+    active_chest: dict[str, object] = {
+        'gadget_id': 0,
+        'pos': None,
+        'subtree': None,
+    }
+
+    def _reset_chest() -> None:
+        subtree = active_chest.get('subtree')
+        if isinstance(subtree, BehaviorTree):
+            try:
+                subtree.reset()
+            except Exception:
+                pass
+        active_chest['gadget_id'] = 0
+        active_chest['pos'] = None
+        active_chest['subtree'] = None
+
+    def _tick(_node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+        if not _open_locked_chests or not Map.IsMapReady() or not Map.IsExplorable():
+            _reset_chest()
+            return BehaviorTree.NodeState.RUNNING
+
+        try:
+            player_id = int(Player.GetAgentID() or 0)
+            if player_id <= 0 or Agent.IsDead(player_id) or Checks.Agents.InDanger():
+                _reset_chest()
+                return BehaviorTree.NodeState.RUNNING
+        except Exception:
+            _reset_chest()
+            return BehaviorTree.NodeState.RUNNING
+
+        current_id = int(active_chest.get('gadget_id') or 0)
+        if current_id <= 0:
+            found = _find_nearest_locked_chest()
+            if found is None:
+                return BehaviorTree.NodeState.RUNNING
+            gid, pos = found
+            _opened_chest_ids.add(gid)
+            active_chest['gadget_id'] = gid
+            active_chest['pos'] = pos
+            active_chest['subtree'] = BT.Sequence(
+                name='OpenLockedChest',
+                children=[
+                    BT.Move([pos], tolerance=150.0, pause_on_combat=True, log=False),
+                    BT.MoveAndInteractWithGadget(
+                        pos=pos,
+                        interaction_count=1,
+                        multi_account=False,
+                        log=True,
+                    ),
+                ],
+            )
+
+        subtree = active_chest.get('subtree')
+        if not isinstance(subtree, BehaviorTree):
+            _reset_chest()
+            return BehaviorTree.NodeState.RUNNING
+
+        state = subtree.tick()
+        if state != BehaviorTree.NodeState.RUNNING:
+            _reset_chest()
+        return BehaviorTree.NodeState.RUNNING
+
+    return BehaviorTree(
+        BehaviorTree.ActionNode(
+            name='LockedChestOpener',
+            action_fn=_tick,
+            aftercast_ms=0,
+        )
+    )
+
+
 def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
-    """Resume a party wipe from the nearest waypoint to the shrine.
-
-    The core service restarts the step that was running, which after the per-point
-    split is the waypoint the party died on: correct, but it walks the party back
-    to that spot from the shrine. This one goes further: after a shrine revival it
-    resolves the waypoint nearest to the shrine, ahead or behind the failed step and
-    on the current map, so the party walks the shortest distance back into its
-    route. A party defeat restarts from Prepare, the step that knows how to travel
-    back, because the route coordinates belong to another map.
-
-    The planner installs the core recovery service unconditionally, so this widget
-    holds `party_wipe_recovery_suppressed` raised for its whole life to keep it
-    quiet and honours its own resign marker instead.
-    """
-
     state: dict[str, object] = {
         "active": False,
         "mode": "",
@@ -1935,8 +1790,6 @@ def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
             return []
 
     def _detect_revive_teleport() -> bool:
-        """Report a move from the death spot to a distant shrine."""
-
         try:
             player_id = Player.GetAgentID()
             if not Agent.IsValid(player_id):
@@ -1956,7 +1809,6 @@ def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
                 return False
             death_pos = state["player_dead_pos"]
             if death_pos and _far(death_pos):
-                # Some revive flows teleport the dead agent before it becomes alive.
                 state["player_was_dead"] = False
                 state["player_dead_pos"] = None
                 return True
@@ -1988,6 +1840,7 @@ def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
             return bool(Map.IsMapReady() and Map.IsOutpost())
         except Exception:
             return False
+
     def _reset_state(node: BehaviorTree.Node) -> None:
         state["active"] = False
         state["mode"] = ""
@@ -2000,9 +1853,6 @@ def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
         node.blackboard["party_wipe_recovery_step_name"] = ""
 
     def _begin_recovery(node: BehaviorTree.Node, mode: str) -> None:
-        # Whatever was queued when the party died would otherwise run after the
-        # revive and fight the step the recovery just resumed at. The core service
-        # flushes here for the same reason.
         from Py4GWCoreLib.py4gwcorelib_src.ActionQueue import ActionQueueManager
 
         state["active"] = True
@@ -2028,10 +1878,6 @@ def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
         names = _planner_step_names()
 
         if mode == "defeated":
-            # From an outpost the route coordinates belong to another map, so the
-            # only step that can get the party back there is the preparation. A
-            # queue has one preparation per entry, so the failed step names the
-            # map to return to instead of the first Prepare in the plan.
             if vanquish_queue:
                 map_name = _map_name_from_step(failed_step_name)
                 if map_name and f'Prepare {map_name}' in names:
@@ -2042,9 +1888,6 @@ def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
             return failed_step_name
 
         try:
-            # Automatic mode resolved a map the combos never selected, so the plan
-            # that is running belongs to `_auto_definition`. A queue walks several
-            # maps, so the one that matters is the map the party is standing on.
             player_id = Player.GetAgentID()
             position = Agent.GetXY(player_id)
             map_id = int(Map.GetMapID() or 0)
@@ -2088,9 +1931,6 @@ def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
         return True
 
     def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
-        # The planner installs the core recovery service unconditionally, so the
-        # only way to keep it quiet is to hold its flag raised. The widget's own
-        # resign marker is what this service honours.
         node.blackboard["party_wipe_recovery_suppressed"] = True
 
         now = _now_ms()
@@ -2106,7 +1946,6 @@ def ZQuestPartyWipeRecoveryService() -> BehaviorTree:
                 PySystem.Console.MessageType.Warning,
             )
         if blocked:
-            # The party dying here is a resign we asked for, not a wipe.
             _reset_state(node)
             return BehaviorTree.NodeState.RUNNING
 
@@ -2236,12 +2075,6 @@ def _build_cleanup_sweeps(definition: VanquishDefinition) -> BehaviorTree:
 
 
 def _mark_recovery_suppression(value: bool) -> BehaviorTree:
-    """Set or clear the widget's own resign marker.
-
-    Kept separate from `party_wipe_recovery_suppressed`, which this widget holds
-    raised so the core recovery service never acts.
-    """
-
     def _set(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
         node.blackboard[_RESIGNING_KEY] = bool(value)
         return BehaviorTree.NodeState.SUCCESS
@@ -2253,21 +2086,8 @@ def _build_run_completion(
     definition: VanquishDefinition,
     is_last_queue_entry: bool = True,
 ) -> BehaviorTree:
-    """Record the run and resign only when the party still has to be in an outpost.
+    children: list[BehaviorTree] = [_action('RecordRunCompletion', lambda _node: _mark_run_completed())]
 
-    The trip back is needed by the repeat loop, which restarts from an outpost;
-    by the staging flow, whose reward step is claimed in the Great Temple and can
-    only map-travel from an outpost; and by every queue entry whose next Prepare
-    still has to travel.
-
-    The last entry of a queue is the exception: with nothing left to walk, the
-    party stays in the map it just cleared instead of being dragged back. The loop
-    keeps its resign even there, because its next pass starts from an outpost.
-    """
-    children: list[BehaviorTree] = [_action('RecordRunCompletion', _mark_run_completed)]
-
-    # A queue needs the outpost only while another entry follows; the loop and the
-    # signpost flow need it every time.
     needs_outpost = bool(loop_runs or take_zquest or (vanquish_queue and not is_last_queue_entry))
     if needs_outpost:
         children.append(_mark_recovery_suppression(True))
@@ -2288,13 +2108,6 @@ def _build_run_completion(
 
 
 def _isolation_enabled() -> bool:
-    """Whether the botting tree isolates this account from the wider group.
-
-    Mirrors the `Account Isolation` checkbox of the botting tree UI. While it is
-    on, the shared-memory gate only delivers messages between accounts that share
-    a party or an isolation group, so a party that does not exist yet cannot be
-    formed over the bus.
-    """
     tree = botting_tree
     if tree is None:
         return False
@@ -2305,30 +2118,8 @@ def _isolation_enabled() -> bool:
 
 
 def _build_form_party() -> BehaviorTree:
-    """Disband, gather the group on the leader's map and invite everyone back.
-
-    `BT.CreateParty(multibox_invite=True)` is the owning wrapper for this flow:
-    `LeaveParty` first, then `SummonAllAccounts` for the accounts that are on a
-    different map (it travels them to the leader's outpost, or to the guild hall
-    when the leader is in one), and finally `InviteAllAccounts`. Running it as the
-    first step means every run starts from a known party state instead of
-    inheriting whatever the previous run left behind.
-
-    The shared-memory census runs first, so the log records who this client could
-    see at the moment it asked for a party.
-
-    Skipped when `Account Isolation` is enabled: the shared-memory gate refuses
-    messages between accounts that are not in the same party or isolation group,
-    so with no party yet the summon and invite would be dropped (each refusal
-    logs a warning and returns -1, so the step would silently do nothing) while
-    the local `LeaveParty` still disbanded whatever was left.
-    """
-
     def _build(_node: BehaviorTree.Node) -> BehaviorTree:
-        # The census runs even when the step is skipped: it is the record of who
-        # this client could see when the run asked for a party, and that is what
-        # tells a missing account apart from a hidden or misplaced one.
-        census = _action('LogSharedMemoryCensus', _log_shared_memory_census)
+        census = _action('LogSharedMemoryCensus', lambda _n: _log_shared_memory_census())
         if _isolation_enabled():
             return BT.Sequence(
                 name='FormPartyIsolated',
@@ -2350,70 +2141,36 @@ def _build_form_party() -> BehaviorTree:
             ],
         )
 
+    return BT.Subtree(name='FormPartyFlow', subtree_fn=_build)
+
 
 def get_execution_steps(definition: VanquishDefinition | None) -> list[tuple[str, Callable[[], BehaviorTree]]]:
-    """Named planner steps for a run.
+    if definition is None:
+        return [
+            ('Form Party', _build_form_party),
+            ('Take ZQuest', _build_zquest_staging),
+            ('Resolve ZQuest', _build_auto_zquest_resolver),
+        ]
 
-    `definition=None` is the automatic ZQuest handling before the map is known:
-    the plan stops after the signpost, with a resolver step that reads the
-    accepted quest and asks the widget for the real plan.
-    """
-    steps: list[tuple[str, Callable[[], BehaviorTree]]] = [
+    steps: list[tuple[str, Callable[[], BehaviorTree]]] = []
+    if take_zquest:
+        steps.append(('Form Party', _build_form_party))
+        steps.append(('Take ZQuest', _build_zquest_staging))
+
+    steps.append(
         (
             f'Prepare {definition.map_name}',
             lambda definition=definition: _build_run_preparation(definition),
-        ),
-    ]
+        )
+    )
 
-    point_number = 0
-    action_number = 0
-    path_items: list[tuple[str, object]] = []
-    if _is_plain_path(definition.vanquish_path):
-        path_items.append(('path', definition.vanquish_path))
-    else:
-        for segment in definition.vanquish_path:
-            path_items.extend(_iter_segment_items(segment))
-
-    for key, value in path_items:
-        if key == 'path':
-            points = _coordinate_path(value, 'vanquish path')
-            for point in points:
-                point_number += 1
-                current_point_number = point_number
-                steps.append(
-                    (
-                        f'Point {current_point_number}',
-                        lambda definition=definition, point=point, point_number=current_point_number: _build_forward_point(
-                            definition,
-                            point,
-                            point_number,
-                        ),
-                    )
-                )
-            continue
-
-        action_number += 1
-        current_action_number = action_number
+    for item in _vanquish_route_items(definition):
         steps.append(
             (
                 item.step_name,
                 lambda definition=definition, item=item: _build_route_item(definition, item),
             )
         )
-
-        steps.extend(
-        [
-            (
-                'Cleanup sweeps',
-                lambda definition=definition: _build_cleanup_sweeps(definition),
-            ),
-            (
-                'Complete and return',
-                lambda definition=definition: _build_run_completion(definition),
-            ),
-        ]
-    )
-    return steps
 
     steps.extend(
         [
@@ -2428,8 +2185,6 @@ def get_execution_steps(definition: VanquishDefinition | None) -> list[tuple[str
         ]
     )
 
-    # Staging flow ends by claiming the reward and dissolving the party, so the
-    # run finishes in the guild hall instead of the temple.
     if take_zquest:
         steps.append(
             (
@@ -2441,12 +2196,6 @@ def get_execution_steps(definition: VanquishDefinition | None) -> list[tuple[str
 
 
 def _queue_definitions() -> list[VanquishDefinition]:
-    """Definitions for the queue, in order, one per map id.
-
-    Two pack files can describe the same map (`DeldrimorBowl` lives under two
-    region folders), and a repeated map id would produce duplicate planner step
-    names, which is exactly what the restart-by-name logic cannot tell apart.
-    """
     definitions: list[VanquishDefinition] = []
     seen: set[int] = set()
     for region, map_name in vanquish_queue:
@@ -2465,16 +2214,6 @@ def _queue_entry_steps(
     definition: VanquishDefinition,
     is_last_queue_entry: bool,
 ) -> list[tuple[str, Callable[[], BehaviorTree]]]:
-    """Prepare, walk, sweep and complete one queued map.
-
-    Every entry repeats the same four steps, and the planner restarts steps by
-    name, so the sweep and completion names carry the map name. The route steps
-    already carry theirs as `(map M)`.
-
-    `is_last_queue_entry` only reaches the completion step: the last entry leaves
-    the party in the map it cleared, every other one resigns so the next Prepare
-    can travel.
-    """
     steps: list[tuple[str, Callable[[], BehaviorTree]]] = [
         (
             f'Prepare {definition.map_name}',
@@ -2509,13 +2248,6 @@ def _queue_entry_steps(
 def get_queue_execution_steps(
     definitions: Sequence[VanquishDefinition],
 ) -> list[tuple[str, Callable[[], BehaviorTree]]]:
-    """One plan for the whole queue: one vanquish per entry, no Form Party.
-
-    A filled queue turns automatic ZQuest handling off (`take_zquest` is
-    `automatic_zquest and not vanquish_queue`), and Form Party exists only as
-    that flow's preparation. Each entry builds its own party inside Prepare, at
-    that map's outpost.
-    """
     steps: list[tuple[str, Callable[[], BehaviorTree]]] = []
     last_index = len(definitions) - 1
     for index, definition in enumerate(definitions):
@@ -2529,27 +2261,16 @@ def get_queue_execution_steps(
 
 
 def _configure_upkeep(tree: BottingTree) -> None:
-    """Push the run configuration and the consumable upkeep service.
-
-    Called once at creation and again whenever a consumables toggle changes;
-    `ConfigureUpkeep` only replaces the upkeep trees, so it does not disturb a
-    running planner (the same runtime-reconfigure pattern the Reputation Farmer
-    and Shards Of Orr BTs use).
-    """
     tree.Config.ConfigureUpkeep(
         looting_enabled=AUTO_LOOT,
         resurrection_scroll=True,
-        # The widget installs its own recovery service below: it resumes at the
-        # nearest waypoint to the shrine instead of the failed step, and a party
-        # defeat goes back through Prepare, which is the step that can travel.
         enable_party_wipe_recovery=False,
         heroai_state_logging=True,
         heroai_state_log_interval_ms=5000,
         consumable_upkeeps=_enabled_consumable_upkeeps(),
     )
-    # ConfigureUpkeep replaces every service tree, so this has to be re-added on
-    # each call, not only at creation.
     tree.AddServiceTree('ZQuestPartyWipeRecoveryService', ZQuestPartyWipeRecoveryService)
+    tree.AddServiceTree('LockedChestOpenerService', LockedChestOpenerService)
 
 
 def ensure_botting_tree() -> BottingTree:
@@ -2559,9 +2280,6 @@ def ensure_botting_tree() -> BottingTree:
     global loaded_map_index
 
     if botting_tree is None:
-        # Automatic mode starts from the discovery plan: the map is unknown until
-        # the signpost quest has been accepted and read. The queue replaces both
-        # with one plan built from its own list.
         if vanquish_queue:
             routine = get_queue_execution_steps(_queue_definitions())
             definition: VanquishDefinition | None = None
@@ -2592,20 +2310,12 @@ def _request_rebuild() -> None:
 
 
 def _request_bot_stop(_node: BehaviorTree.Node) -> BehaviorTree.NodeState:
-    """Ask the widget loop to stop the bot and keep the step alive until it does.
-
-    Returning RUNNING instead of failing is deliberate: a failure would make the
-    planner restart the current named step, and the stop has to run outside the
-    tree tick so `BottingTree.Stop` can reset the tree and restore the account
-    state safely.
-    """
     global _stop_after_sweeps
     _stop_after_sweeps = True
     return BehaviorTree.NodeState.RUNNING
 
 
 def _apply_pending_stop() -> None:
-    """Stop the bot when the tree requested it, outside of the tree tick."""
     global _stop_after_sweeps
     if not _stop_after_sweeps:
         return
@@ -2640,8 +2350,6 @@ def _apply_pending_rebuild() -> None:
         previous_tree.Stop()
     botting_tree = None
     pending_rebuild = False
-    # A fresh tree in automatic mode goes back to the discovery plan, so the map
-    # resolved by the previous run must not survive it.
     _auto_definition = None
 
     try:
@@ -2664,20 +2372,10 @@ def _apply_pending_rebuild() -> None:
 
 
 def _staging_district() -> int:
-    """Random low-traffic district channel for a staging travel."""
     return int(random.choice(STAGING_DISTRICTS))
 
 
 def _build_travel_to_map(map_id: int, label: str) -> BehaviorTree:
-    """Travel to a map unless the party is already there.
-
-    Shared by the staging travel, the reward travel and the approach to the
-    vanquish outpost, so all three land in the same randomised low-traffic
-    district instead of the default one. Travel is local: a formed party travels
-    with its leader, and broadcasting a TravelToMap command per follower would
-    fight the party travel.
-    """
-
     if map_id <= 0:
         return BT.Succeeder(name=f'No{label}Travel')
 
@@ -2709,13 +2407,6 @@ def _nearest_living_agent(
     name_filter: str = '',
     max_distance: float = 0.0,
 ) -> tuple[int, tuple[float, float]]:
-    """Nearest living, non-player agent to a point, as (agent_id, xy).
-
-    Players are excluded so a party member standing on the spot cannot be picked
-    instead of the NPC. Names come from `Agent.GetNameByID`, which returns an
-    empty string until the client has decoded the name, hence the retry gate the
-    callers wrap around this.
-    """
     player_id = int(Player.GetAgentID() or 0)
     best_id = 0
     best_position = (0.0, 0.0)
@@ -2742,12 +2433,6 @@ def _nearest_living_agent(
 
 
 def _leader_anchor() -> tuple[float, float]:
-    """Leader position, falling back to the staging anchor when it cannot be read.
-
-    `Player.GetXY` is the only source that reflects where the party actually is;
-    the staging anchor is the last resort for the frames where the map data is not
-    ready yet, so the resolver always has a usable reference.
-    """
     try:
         position = Player.GetXY()
         if position:
@@ -2758,45 +2443,18 @@ def _leader_anchor() -> tuple[float, float]:
 
 
 def _resolve_vanquish_signpost() -> tuple[int, tuple[float, float]]:
-    """Nearest 'Zaishen Vanquish' signpost to the leader.
-
-    Embark Beach holds several signposts, so the name alone does not pick one. The
-    closest to the leader is the one the party is actually going to walk to,
-    whichever side of the outpost it spawned on; a fixed anchor assumed one side.
-    The anchor stays as the reference for the frames where the position cannot be
-    read yet.
-    """
     return _nearest_living_agent(_leader_anchor(), name_filter=ZQUEST_SIGNPOST_NAME)
 
 
 def _resolve_reward_npc() -> tuple[int, tuple[float, float]]:
-    """Reward NPC in the Great Temple of Balthazar, resolved by its name.
-
-    "Zehnchu [Zaishen Challenge]" is a single NPC standing among others, so the
-    name is the identity and no distance filter is needed; `Agent.GetNameByID`
-    may return an empty string until the client decodes it, which is what the
-    caller's retry gate is for.
-    """
     return _nearest_living_agent(ZQUEST_REWARD_NPC, name_filter=ZQUEST_REWARD_NPC_NAME)
 
 
 def _now_ms() -> float:
-    """Monotonic clock in milliseconds for the readiness deadline."""
-
     return time.monotonic() * 1000.0
 
 
 def _remote_accounts_on_leader_map() -> tuple[bool, list[str]]:
-    """Whether every other account reports the leader's map and district.
-
-    Each account publishes its map in shared memory only after its own client is
-    fully loaded, so a leader that finishes loading first sees the others still
-    pointed at the previous map. The dialog fan-out resolves its agent on the
-    leader and messages the rest: sending it now means the followers receive an
-    order for a map they are not in yet, acknowledge it, do nothing, and the party
-    ends up with only some accounts holding the quest.
-    """
-
     sender_email = ''
     pending: list[str] = []
     try:
@@ -2832,13 +2490,6 @@ def _remote_accounts_on_leader_map() -> tuple[bool, list[str]]:
 
 
 def _wait_remote_accounts_ready(label: str) -> BehaviorTree:
-    """Hold a multibox dialog until the other accounts are in the same instance.
-
-    Bounded on purpose: an account that is legitimately elsewhere must not stall
-    the step forever, so the wait gives up after the remote party timeout and
-    leaves a warning naming the accounts that were not ready.
-    """
-
     state = {'started_ms': 0.0, 'reported': False}
 
     def _tick(_node: BehaviorTree.Node) -> BehaviorTree.NodeState:
@@ -2861,8 +2512,6 @@ def _wait_remote_accounts_ready(label: str) -> BehaviorTree:
                 'sending the dialog anyway.',
                 PySystem.Console.MessageType.Warning,
             )
-            # The census right after the warning is what separates "the alt is
-            # in another district" from "the alt is not publishing at all".
             for line in _shared_memory_census():
                 PySystem.Console.Log(MODULE_NAME, line, PySystem.Console.MessageType.Warning)
         return BehaviorTree.NodeState.SUCCESS
@@ -2871,8 +2520,6 @@ def _wait_remote_accounts_ready(label: str) -> BehaviorTree:
 
 
 class MultiboxDialogSpec(NamedTuple):
-    """Everything one multibox autodialog step needs."""
-
     button: int
     fallback_point: tuple[float, float]
     agent_key: str
@@ -2901,19 +2548,6 @@ _REWARD_DIALOG = MultiboxDialogSpec(
 
 
 def _wait_dialog_agent(spec: MultiboxDialogSpec) -> BehaviorTree:
-    """Resolve the dialog agent, waiting until the client has decoded its name.
-
-    `BehaviorTree.WaitUntilNode` is not usable for this: a `False` from its
-    condition is a terminal FAILURE, not "keep waiting", so a predicate that
-    answers "not yet" burns the whole retry budget on its first evaluation. After
-    a party map load the agent array exists but `Agent.GetNameByID` still returns
-    empty while names decode, so the resolver answers "not yet" for a second or
-    two — and the step dropped straight into the fallback branch. That branch
-    interacts locally and only messages the group once the local dialog is
-    accepted, so the leader ends up at the signpost with the followers still
-    standing at the portal and the whole step fails on the local dialog timeout.
-    """
-
     state = {'deadline_ms': 0.0}
 
     def _tick(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
@@ -2940,22 +2574,6 @@ def _wait_dialog_agent(spec: MultiboxDialogSpec) -> BehaviorTree:
 
 
 def _build_multibox_dialog(spec: MultiboxDialogSpec) -> BehaviorTree:
-    """Resolve an agent, fan the dialog out and wait for every account.
-
-    The command goes to every account, this client included, so one handler does
-    all the work: it walks to the agent, interacts by id and presses the button.
-    Nothing runs locally in parallel, which is why the leader behaves exactly
-    like the rest. When the agent cannot be resolved the point-based node takes
-    over and fans out the same dialog after walking there. Confirmation is a
-    message-dispatch wait, so it only proves each handler finished, not that the
-    game accepted the dialog.
-
-    It waits for the other accounts to report this map first: a leader that
-    finishes loading before its followers would otherwise dispatch an order for
-    an agent the followers cannot see yet, and only some of them would end up
-    with the quest.
-    """
-
     def _resolved_branch(node: BehaviorTree.Node) -> BehaviorTree:
         agent_id = int(node.blackboard.get(spec.agent_key, 0) or 0)
         if agent_id <= 0:
@@ -3024,13 +2642,6 @@ def _build_multibox_dialog(spec: MultiboxDialogSpec) -> BehaviorTree:
 
 
 def _active_quest_id() -> int:
-    """The active quest id, or 0.
-
-    Only the active quest is read, never the log. `RequestQuestInfo` is what the
-    client uses to select a quest, so asking for the text of every logged quest
-    walks the quest tracker through unrelated entries: the run ends up resolving a
-    map, and switching the client, for a quest the party is not doing.
-    """
     try:
         return int(GLOBAL_CACHE.Quest.GetActiveQuest() or 0)
     except Exception:
@@ -3038,29 +2649,11 @@ def _active_quest_id() -> int:
 
 
 def _quest_text_value(raw: object) -> str:
-    """Client quest string, minus the decoder's failure sentinel.
-
-    The async decoders answer `Timeout` when the text has not arrived yet; the
-    rest of the repo treats it as a retry signal (`quest_data_src.py`), never as
-    text. Returning '' keeps the poll going instead of trying to match an area
-    called "Timeout".
-    """
     text = str(raw or '')
     return '' if text.strip().lower() == 'timeout' else text
 
 
 def _read_quest_texts(quest_id: int, request: bool, request_info: bool = False) -> tuple[str, str, str]:
-    """(objectives, description, name) for a quest, empty while not ready.
-
-    The vanquish objective is the string that names the area (`Clear Pongmei
-    Valley near Kaineng City of all enemies in hard mode.`), so it is the primary
-    source; the description is only a fallback and the title the last resort.
-
-    `request_info` asks the client for the quest record itself, once per quest:
-    the per-field decoders answer with the `Timeout` sentinel when the record was
-    never requested, which is what the account quest cache does before it reads
-    a field.
-    """
     if request_info:
         GLOBAL_CACHE.Quest.RequestQuestInfo(quest_id)
     if request:
@@ -3080,7 +2673,6 @@ def _read_quest_texts(quest_id: int, request: bool, request_info: bool = False) 
 
 
 def _select_map(region: str, map_name: str) -> None:
-    """Point the combos at the resolved map so the UI and the plan agree."""
     global region_index
     global map_index
     if region in REGIONS:
@@ -3091,21 +2683,6 @@ def _select_map(region: str, map_name: str) -> None:
 
 
 def _build_auto_zquest_resolver() -> BehaviorTree:
-    """Name the area from the vanquish quest the signpost just gave the party.
-
-    The plan cannot be built before this runs: the route belongs to the map and
-    the signpost picks the map. The step reads the objectives of the **active**
-    quest — never the quest log, because `RequestQuestInfo` selects the quest it
-    describes and walking the log would leave the client tracking an unrelated
-    one — resolves the area against the map catalog and stores the definition,
-    then asks the widget to swap the remaining steps for the resolved run.
-
-    It never reports success while it is waiting: a completed pass stops the tree,
-    and the swap has to happen with the tree still running, so the step stays
-    RUNNING until the new plan replaces it. The clock is capped, and when it runs
-    out the step logs the text it saw and reports success so the run ends instead
-    of retrying a quest that will not resolve.
-    """
     state: dict[str, float | str | bool] = {
         'deadline_ms': 0.0,
         'last_request_ms': 0.0,
@@ -3117,13 +2694,11 @@ def _build_auto_zquest_resolver() -> BehaviorTree:
         PySystem.Console.Log(MODULE_NAME, message, PySystem.Console.MessageType.Error)
         return BehaviorTree.NodeState.SUCCESS
 
-    def _resolve(node: BehaviorTree.Node) -> BehaviorTree.NodeState:
+    def _resolve(_node: BehaviorTree.Node) -> BehaviorTree.NodeState:
         global _auto_definition
         global _pending_planner_swap
 
         if _auto_definition is not None and not _pending_planner_swap:
-            # The swap clears the request; seeing the definition without it means
-            # the planner was not replaced and this step would run forever.
             return _stop(
                 'Automatic ZQuest: the map was resolved but the planner swap did '
                 'not apply. Stopping instead of walking the wrong plan.'
@@ -3139,8 +2714,6 @@ def _build_auto_zquest_resolver() -> BehaviorTree:
 
         quest_id = _active_quest_id()
         if quest_id > 0:
-            # The quest record is asked for once; the per-field decoders answer
-            # with the `Timeout` sentinel until it has been requested.
             request_info = not bool(state['info_requested'])
             if request_info:
                 state['info_requested'] = True
@@ -3182,12 +2755,6 @@ def _build_auto_zquest_resolver() -> BehaviorTree:
 
 
 def _build_zquest_staging() -> BehaviorTree:
-    """Travel to Embark Beach and take the vanquish quest from the signpost.
-
-    Runs before Prepare travels to the vanquish outpost. The step is only
-    included when automatic ZQuest handling is on, because that is the flow that
-    reads the map out of the quest this step accepts; a queued run never takes it.
-    """
     return BT.Sequence(
         name='TakeZQuest',
         children=[
@@ -3198,13 +2765,6 @@ def _build_zquest_staging() -> BehaviorTree:
 
 
 def _apply_pending_planner_swap() -> None:
-    """Replace the discovery steps with the plan for the resolved map.
-
-    Runs from the widget loop, after the tick that resolved the map: the running
-    planner must not be mutated from inside one of its own nodes. The new steps
-    are installed with `start_from` at the preparation step, so the run continues
-    where the quest was accepted instead of travelling back to Embark Beach.
-    """
     global _pending_planner_swap
     global _auto_definition
 
@@ -3247,32 +2807,12 @@ def _apply_pending_planner_swap() -> None:
 
 
 def _reset_auto_resolution_on_stop(tree: BottingTree) -> None:
-    """Put the discovery plan back once an automatic run is over.
-
-    The completed run replaced the planner steps with the resolved route, so a
-    new start would skip the signpost and walk a map the party may no longer
-    hold. Rebuilding the tree restores the discovery steps and clears the
-    resolved map.
-    """
     if not automatic_zquest or _auto_definition is None or tree.IsStarted():
         return
     _request_rebuild()
 
 
 def _build_leave_party_and_travel_gh() -> BehaviorTree:
-    """Dissolve the party on every account and send them to the guild hall.
-
-    Mirrors HeroAI's "Leave & Travel to GH" command: every account, this client
-    included, receives LeaveParty and then TravelToGuildHall through its own
-    Messaging widget. That means the leader needs the widget enabled as well; if
-    it is off the leave is never acknowledged and the step fails after
-    `ZQUEST_MESSAGE_TIMEOUT_MS`.
-
-    The leave is awaited so every client is out of the party before the guild
-    hall travel is dispatched. The travel itself is fire-and-forget: a map load
-    takes longer than a message ack, and this is the last step of the plan.
-    """
-
     def _remote_leave(_node: BehaviorTree.Node) -> BehaviorTree:
         return RoutinesBT.Shared.SendAndWait(
             command=SharedCommandType.LeaveParty,
@@ -3301,13 +2841,6 @@ def _build_leave_party_and_travel_gh() -> BehaviorTree:
 
 
 def _build_zquest_reward() -> BehaviorTree:
-    """Claim the quest reward in the Great Temple of Balthazar.
-
-    Runs after the run completed and resigned, so the party travels from the
-    vanquish outpost to the temple and claims the reward there. The dialog is
-    fanned out like the signpost one: every account walks to the reward NPC, and
-    the step only ends once all of them finished.
-    """
     return BT.Sequence(
         name='ZQuestReward',
         children=[
@@ -3329,6 +2862,7 @@ def _draw_config() -> None:
     global reverse_clear_radius_1
     global reverse_clear_radius_2
     global vanquish_queue
+    global _open_locked_chests
 
     tree = botting_tree
     locked = bool(tree is not None and tree.IsStarted())
@@ -3344,10 +2878,7 @@ def _draw_config() -> None:
     if new_automatic != automatic_zquest:
         automatic_zquest = new_automatic
         if automatic_zquest:
-            # The map comes from the quest the signpost hands over and a repeated
-            # pass would have nothing left to accept.
             loop_runs = False
-        # Taking the quest is derived from this switch, not toggled on its own.
         _sync_take_zquest()
         _auto_definition = None
         _save_settings()
@@ -3429,8 +2960,11 @@ def _draw_config() -> None:
             'Take ZQuest is off while Loop vanquish is enabled.',
             (160, 160, 160, 255),
         )
-        # Nothing in the plan depends on it: the log is sampled from the widget
-        # loop, so there is no tree to rebuild.
+
+    PyImGui.separator()
+    new_open_chests = PyImGui.checkbox('Open nearby locked chests', _open_locked_chests)
+    if new_open_chests != _open_locked_chests:
+        _open_locked_chests = new_open_chests
         _save_settings()
 
     PyImGui.separator()
@@ -3450,12 +2984,8 @@ def _draw_config() -> None:
 
     PyImGui.end_disabled()
 
-def _apply_consumable_upkeep_change() -> None:
-    """Re-push the upkeep service so toggles apply without a tree rebuild.
 
-    `ConfigureUpkeep` replaces only the upkeep trees, so this is safe while the
-    bot is running; the restock toggles take effect on the next run preparation.
-    """
+def _apply_consumable_upkeep_change() -> None:
     if botting_tree is None:
         return
     _configure_upkeep(botting_tree)
@@ -3469,18 +2999,8 @@ def _draw_consumable_group(
     restock: bool,
     on_change,
 ) -> tuple[bool, bool, set[int]]:
-    """Draw one conset/pcon group: master toggles plus a per-item checklist.
-
-    Returns the (possibly updated) activate flag, restock flag and selection so
-    the caller can persist them and re-push the upkeep service.
-    """
     new_selection = set(selected)
 
-    # The collapsing header's identity is its label, so the volatile "n/m
-    # selected" count must not live in the portion ImGui hashes. Everything
-    # before "###" is display-only; the part after it is the stable identity.
-    # Without this split the label changes on every toggle, which ImGui reads as
-    # a brand-new item defaulting to closed -- collapsing the list on each click.
     if PyImGui.collapsing_header(
         f'{label} ({len(new_selection)}/{len(model_ids)} selected)###{label}_group_header'
     ):
@@ -3671,9 +3191,6 @@ def _format_time(seconds: float) -> str:
 
 def _draw_run_status() -> None:
     if vanquish_queue:
-        # The combos do not drive a queued run, so listing a "selected" map here
-        # would name a map the plan is not going to walk. The loop re-runs Form
-        # Party, so the party clause has to follow the loop rather than the queue.
         party_clause = 'party re-formed each pass' if loop_runs else 'party formed once'
         PyImGui.text(f'Queue: {len(vanquish_queue)} vanquishes, {party_clause}')
     elif automatic_zquest and _auto_definition is None:
