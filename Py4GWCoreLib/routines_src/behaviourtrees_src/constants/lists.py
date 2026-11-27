@@ -22,4 +22,8 @@ CONSET_UPKEEPS = [
     ModelID.Essence_Of_Celerity.value,
     ModelID.Grail_Of_Might.value,
     ModelID.Armor_Of_Salvation.value,
+    ModelID.Heroes_Trifectas.value,
+    ModelID.Empowering_Feasts.value,
+    ModelID.Infinite_Birds_Eye_Compass.value,
+    ModelID.Infinite_Stalkers_Ration.value,
 ]

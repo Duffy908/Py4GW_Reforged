@@ -1208,10 +1208,10 @@ class ModelID(IntEnum):
     Elonian_Leather_Square = 943
     Eaglecrest_Axe = 1985
     Emerald_Blade = 1976
-    Empowering_Feast = 38618
     Enchanted_Lodestone = 431
     Elemental_Crystal_Shard = 38302
     Elemental_Keystone = 38301
+    Empowering_Feasts = 38618
     Enchanted_Vine = 834
     Encrusted_Lodestone = 451
     Encrypted_Charr_Battle_Plans = 27976
@@ -1333,8 +1333,8 @@ class ModelID(IntEnum):
     Heket_Tongue = 19199
     Heket_Warrior_Mini = 22760
     Heleynes_Insight = 36676
-    Heroes_Trifecta = 38619
     Heros_Handbook = 26899
+    Heroes_Trifectas = 38619
     Heros_Zaishen_Strongbox = 36666
     Herring_Mini_Black_Moa_Chick_Incubator = 26502
     High_Priest_Zhang_Mini = 36649
